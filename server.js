@@ -7,16 +7,21 @@ const session = require('express-session');
 const app = express();
 const PORT = 3001;
 
-// ===== GOOGLE CONSOLE CREDENTIALS (use env vars, do NOT commit secrets) =====
+// ===== GOOGLE CONSOLE CREDENTIALS (use env vars) =====
 const GOOGLE_CONFIG = {
-  clientId: process.env.GOOGLE_CLIENT_ID || '',
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+  clientId: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
   redirectUri: process.env.REDIRECT_URI || 'http://localhost:3001/auth/callback',
   scopes: [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/userinfo.email'
   ]
 };
+
+if (!GOOGLE_CONFIG.clientId || !GOOGLE_CONFIG.clientSecret) {
+  console.error('ERROR: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in .env file');
+  process.exit(1);
+}
 
 // Session secret should come from env in production. Fallback only for local dev.
 const SESSION_SECRET = process.env.SESSION_SECRET || ('dev-secret-' + Date.now());
