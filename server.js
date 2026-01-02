@@ -1,5 +1,7 @@
 // server.js
 const express = require('express');
+// Load local .env into process.env (dev only) - kept out of git
+try { require('dotenv').config(); } catch (e) { /* dotenv may be absent in some environments */ }
 const axios = require('axios');
 const cors = require('cors');
 const session = require('express-session');
@@ -7,7 +9,8 @@ const session = require('express-session');
 const app = express();
 const PORT = 3001;
 
-// ===== GOOGLE CONSOLE CREDENTIALS (use env vars) =====
+// ===== GOOGLE CONSOLE CREDENTIALS (load from env) =====
+// IMPORTANT: set these in your local .env (development) or environment.
 const GOOGLE_CONFIG = {
   clientId: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
@@ -18,13 +21,12 @@ const GOOGLE_CONFIG = {
   ]
 };
 
-if (!GOOGLE_CONFIG.clientId || !GOOGLE_CONFIG.clientSecret) {
-  console.error('ERROR: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in .env file');
-  process.exit(1);
-}
-
-// Session secret should come from env in production. Fallback only for local dev.
+// Session secret should come from env in production. Use a lightweight dev fallback.
 const SESSION_SECRET = process.env.SESSION_SECRET || ('dev-secret-' + Date.now());
+
+// Single-user global auth storage (WARNING: NOT SECURE, dev/testing only)
+// This allows client to make API requests without any auth headers
+let globalAuth = null;
 
 app.use(cors({
   origin: true, // Allow any localhost origin
@@ -39,9 +41,23 @@ app.use(session({
   saveUninitialized: false,
   cookie: { 
     secure: false,
+    httpOnly: true,
+    sameSite: 'lax', // Allow cookies on redirects from Google
     maxAge: 24 * 60 * 60 * 1000 // 24 hours
   }
 }));
+
+// Debug middleware - log session state
+app.use((req, res, next) => {
+  if (req.path.includes('/auth')) {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`, {
+      sessionID: req.sessionID,
+      hasAccessToken: !!globalAuth?.accessToken,
+      userEmail: globalAuth?.userEmail
+    });
+  }
+  next();
+});
 
 // ===== OAuth endpoints =====
 app.get('/auth/login', (req, res) => {
@@ -84,16 +100,20 @@ app.get('/auth/callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
 
-    req.session.accessToken = access_token;
-    req.session.refreshToken = refresh_token;
-    req.session.tokenExpiry = Date.now() + (expires_in * 1000);
+    // Store tokens globally (single-user mode - no client auth required)
+    globalAuth = {
+      accessToken: access_token,
+      refreshToken: refresh_token,
+      tokenExpiry: Date.now() + (expires_in * 1000),
+      userEmail: null
+    };
 
     // Retrieve user's email
     try {
       const userInfoResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { Authorization: `Bearer ${access_token}` }
       });
-      req.session.userEmail = userInfoResponse.data.email;
+      globalAuth.userEmail = userInfoResponse.data.email;
     } catch (error) {
       console.error('Error retrieving email:', error);
     }
@@ -107,52 +127,38 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 app.get('/auth/status', (req, res) => {
-  const isAuthenticated = !!req.session.accessToken;
+  const isAuthenticated = !!globalAuth && !!globalAuth.accessToken;
   res.json({ 
     authenticated: isAuthenticated,
-    email: req.session.userEmail || null
+    email: globalAuth?.userEmail || null
   });
 });
 
 app.post('/auth/logout', async (req, res) => {
-  const accessToken = req.session && req.session.accessToken;
-
-  // Try to revoke token at Google (best-effort for testing)
-  if (accessToken) {
-    try {
-      await axios.post(`https://oauth2.googleapis.com/revoke?token=${accessToken}`);
-    } catch (err) {
-      console.error('Token revoke failed:', err.response?.data || err.message);
-      // continue — don't fail logout if revoke fails
-    }
-  }
-
-  req.session.destroy((err) => {
-    if (err) {
-      console.error('Session destroy error:', err);
-      return res.status(500).json({ success: false, error: 'Session destroy error' });
-    }
-    res.json({ success: true });
-  });
+  // Don't revoke token - Google seems to lose gmail.readonly scope after revoke
+  // Just clear the global auth cache
+  globalAuth = null;
+  console.log('Global auth cleared');
+  res.json({ success: true });
 });
 
-// ===== Middleware: token verification =====
+// ===== Middleware: token verification (single-user global) =====
 const ensureAuthenticated = async (req, res, next) => {
-  if (!req.session.accessToken) {
+  if (!globalAuth || !globalAuth.accessToken) {
     return res.status(401).json({ error: 'Not authorized' });
   }
 
-  if (req.session.tokenExpiry && Date.now() >= req.session.tokenExpiry && req.session.refreshToken) {
+  if (globalAuth.tokenExpiry && Date.now() >= globalAuth.tokenExpiry && globalAuth.refreshToken) {
     try {
       const refreshResponse = await axios.post('https://oauth2.googleapis.com/token', {
-        refresh_token: req.session.refreshToken,
+        refresh_token: globalAuth.refreshToken,
         client_id: GOOGLE_CONFIG.clientId,
         client_secret: GOOGLE_CONFIG.clientSecret,
         grant_type: 'refresh_token'
       });
 
-      req.session.accessToken = refreshResponse.data.access_token;
-      req.session.tokenExpiry = Date.now() + (refreshResponse.data.expires_in * 1000);
+      globalAuth.accessToken = refreshResponse.data.access_token;
+      globalAuth.tokenExpiry = Date.now() + (refreshResponse.data.expires_in * 1000);
     } catch (error) {
       console.error('Error refreshing token:', error.response?.data);
       return res.status(401).json({ error: 'Token expired' });
@@ -170,7 +176,7 @@ app.get('/api/gmail/messages', ensureAuthenticated, async (req, res) => {
     const response = await axios.get(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages`,
       {
-        headers: { Authorization: `Bearer ${req.session.accessToken}` },
+        headers: { Authorization: `Bearer ${globalAuth.accessToken}` },
         params: { q, maxResults, pageToken }
       }
     );
@@ -186,7 +192,7 @@ app.get('/api/gmail/messages', ensureAuthenticated, async (req, res) => {
       // Fetch metadata (From, Subject, Date) for each message in parallel
       const detailPromises = ids.map(id =>
         axios.get(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`, {
-          headers: { Authorization: `Bearer ${req.session.accessToken}` },
+          headers: { Authorization: `Bearer ${globalAuth.accessToken}` },
           params: { format: 'metadata', metadataHeaders: ['From', 'Subject', 'Date'] }
         }).then(r => r.data).catch(err => ({ id, error: err.response?.data || err.message }))
       );
@@ -229,7 +235,7 @@ app.get('/api/gmail/messages/:id', ensureAuthenticated, async (req, res) => {
     const response = await axios.get(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`,
       {
-        headers: { Authorization: `Bearer ${req.session.accessToken}` },
+        headers: { Authorization: `Bearer ${globalAuth.accessToken}` },
         params: { format }
       }
     );
