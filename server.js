@@ -5,24 +5,25 @@ try { require('dotenv').config(); } catch (e) { /* dotenv may be absent in some 
 const axios = require('axios');
 const cors = require('cors');
 const session = require('express-session');
+SESSION_SECRET=`f3c7e9a2b5d4c6e1f8a9b0c3d2e1f4a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2`
 
 const app = express();
 const PORT = 3001;
+
+REDIRECT_URI=`http://localhost:${PORT}/auth/callback`
 
 // ===== GOOGLE CONSOLE CREDENTIALS (load from env) =====
 // IMPORTANT: set these in your local .env (development) or environment.
 const GOOGLE_CONFIG = {
   clientId: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  redirectUri: process.env.REDIRECT_URI || 'http://localhost:3001/auth/callback',
+  redirectUri: REDIRECT_URI,
   scopes: [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/userinfo.email'
   ]
 };
 
-// Session secret should come from env in production. Use a lightweight dev fallback.
-const SESSION_SECRET = process.env.SESSION_SECRET || ('dev-secret-' + Date.now());
 
 // Single-user global auth storage (WARNING: NOT SECURE, dev/testing only)
 // This allows client to make API requests without any auth headers
@@ -61,7 +62,10 @@ app.use((req, res, next) => {
 
 // ===== OAuth endpoints =====
 app.get('/auth/login', (req, res) => {
-  const returnTo = req.query.returnTo || req.headers.referer || 'http://localhost:3000';
+  const returnTo = req.query.returnTo || req.headers.referer ;
+  if (!returnTo) {
+    return res.status(400).send('Error: returnTo URL is required');
+  }
   req.session.returnTo = returnTo;
   
   const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
@@ -118,7 +122,10 @@ app.get('/auth/callback', async (req, res) => {
       console.error('Error retrieving email:', error);
     }
 
-    const returnUrl = req.session.returnTo || 'http://localhost:3000';
+    const returnUrl = req.session.returnTo ;
+    if (!returnUrl) {
+      return res.status(400).send('Error: no return URL in session');
+    }
     res.redirect(`${returnUrl}?auth=success`);
   } catch (error) {
     console.error('Error exchanging code for token:', error.response?.data || error.message);
